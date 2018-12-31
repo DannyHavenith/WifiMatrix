@@ -21,6 +21,30 @@
 
 namespace {
 
+// setup to talk to a max7219 display array.
+struct spi_pins
+{
+    PIN_TYPE( B, 3) mosi;
+    PIN_TYPE( B, 5) clk;
+    pin_definitions::null_pin_type miso;
+};
+
+// this display has 9 matrices, talks through bit-banged spi and uses B4 as cs pin.
+using csk_type = PIN_TYPE( B, 4);
+using spi_type = bitbanged_spi< spi_pins>;
+constexpr uint8_t matrix_count = 9;
+using display_type = max7219::display_buffer<matrix_count, spi_type, csk_type>;
+display_type display;
+
+
+/// very crude pseudo random generator
+uint16_t my_rand()
+{
+    static uint16_t state;
+    return state += 13331; // adding a prime number
+}
+
+
 /**
  * Global state that describes the behaviour of this device.
  */
@@ -43,27 +67,14 @@ struct global_state_type
     uint8_t  wait_step = 48;
     uint8_t  wait_accumulator = 0;
     static constexpr uint8_t wait_threshold = 128;
+    bool do_snowflakes = false;
+    bool snowflakes_falling = false;
 } g;
 
 // communication with esp-link
 esp_link::client::uart_type uart{19200};
 IMPLEMENT_UART_INTERRUPT( uart);
 esp_link::client esp{ uart};
-
-// setup to talk to a max7219 display array.
-struct spi_pins
-{
-    PIN_TYPE( B, 3) mosi;
-    PIN_TYPE( B, 5) clk;
-    pin_definitions::null_pin_type miso;
-};
-
-// this display has 9 matrices, talks through bit-banged spi and uses B4 as cs pin.
-using csk_type = PIN_TYPE( B, 4);
-using spi_type = bitbanged_spi< spi_pins>;
-constexpr uint8_t matrix_count = 9;
-using display_type = max7219::display_buffer<matrix_count, spi_type, csk_type>;
-display_type display;
 
 PIN_TYPE( B, 6) led;
 
@@ -170,6 +181,26 @@ char *my_strcpy( char *dest, const char *src, uint16_t len)
     return dest;
 }
 
+template< typename IntegerType>
+bool assign_if_topic(
+        IntegerType &value,
+        const char *expected,
+        const char *(&topic_start),
+        const char *topic_end,
+        esp_link::string_ref &message)
+{
+    using namespace text_parsing;
+    if (consume(topic_start, topic_end, expected))
+    {
+        value = parse_uint16( message.buffer, message.buffer + message.len);
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
 /**
  * This function is called when an update is received on the subscribed MQTT topic.
  */
@@ -201,6 +232,7 @@ void update( const esp_link::packet *p, uint16_t size)
             if (not g.do_scroll)
             {
                 display.transmit();
+                g.text_offset = 0;
             }
         }
         else if (consume( topic_ptr, topic_end, "flash"))
@@ -228,6 +260,14 @@ void update( const esp_link::packet *p, uint16_t size)
         {
             g.set_speed( parse_uint16( message.buffer, message.buffer + message.len));
         }
+        else if (consume( topic_ptr, topic_end, "snow"))
+        {
+            g.do_snowflakes = parse_uint16( message.buffer, message.buffer + message.len) != 0;
+            if (g.do_snowflakes)
+            {
+                g.snowflakes_falling = true;
+            }
+        }
     }
 }
 
@@ -242,6 +282,127 @@ void connected( const esp_link::packet *p, uint16_t size)
     clear(led);
 }
 
+class snowflakes_type
+{
+public:
+
+    bool render( display_type &display, bool create_new = true)
+    {
+        update_wind();
+
+        bool active = false;
+        for ( uint8_t i = 0; i < count; ++i)
+        {
+            auto &flake = flakes[i];
+
+            flake.step();
+            if (flake.at_end())
+            {
+                if (create_new)
+                {
+                    flake = random_snowflake();
+                }
+            }
+            else
+            {
+                active = true;
+            }
+            if (i < threshold)
+            {
+                flake.offset_x( wind1);
+            }
+            else
+            {
+                flake.offset_x( wind2);
+            }
+            flake.render( display);
+        }
+        return active;
+    }
+
+private:
+
+    class snowflake
+    {
+    public:
+        snowflake()
+        :x{0}, y{y_end}, vy{0}
+        {
+
+        }
+        snowflake( int16_t x, uint8_t vy)
+        :x{x}, y{0}, vy{vy}
+        {
+        }
+
+        void step( )
+        {
+            if (not at_end())
+            {
+                y += vy;
+            }
+        }
+
+        void offset_x( int8_t offset)
+        {
+            x += offset;
+            if (x < 0 or x >= (8 * matrix_count * x_scale))
+            {
+                x = 0;
+                y = y_end;
+            }
+        }
+
+        void render( display_type &display)
+        {
+            if (not at_end())
+            {
+                display.set_pixel( x / x_scale, y / y_scale);
+            }
+        }
+
+        bool at_end() const
+        {
+            return y >= y_end;
+        }
+
+    private:
+        static constexpr uint8_t x_scale = 16;
+        static constexpr uint8_t y_scale = 16;
+        static constexpr uint8_t y_end = 8 * y_scale;
+
+        int16_t x; // in 10.6 fixed point
+        uint8_t y;  // in 4.4 fixed point
+        uint8_t vy; // in 4.4 fixed point
+    };
+
+    static snowflake random_snowflake()
+    {
+        return
+            {
+                static_cast<int16_t>( my_rand()%(8*matrix_count*16)),
+                static_cast<uint8_t>( 1 + my_rand()%4)
+            };
+    }
+
+    void update_wind()
+    {
+        constexpr int8_t wind_limit = 3;
+        if (wind1 > -wind_limit and (my_rand() & 0x18) == 0) --wind1;
+        if (wind1 < wind_limit  and (my_rand() & 0x18) == 0) ++wind1;
+        if (wind2 > -wind_limit and (my_rand() & 0x18) == 0) --wind2;
+        if (wind2 < wind_limit  and (my_rand() & 0x18) == 0) ++wind2;
+
+        if (threshold > count/3 and (my_rand() & 0x10)) --threshold;
+        if (threshold < (2 * count) / 3  and (my_rand() & 0x10)) ++threshold;
+    }
+
+    static constexpr uint8_t count = 20;
+    int8_t threshold = count/2;
+    snowflake flakes[20];
+    int8_t wind1 = 0;
+    int8_t wind2 = -3;
+} snowflakes;
 
 }
 
@@ -255,7 +416,7 @@ int main()
     for (int16_t offset = 0; offset > -150; --offset)
     {
         display.clear();
-        render_string("wait wait wait wait wait wait wait wait wait wait", offset);
+        render_string("wait wait wait wait wait wait wait", offset);
         display.transmit();
         _delay_ms( 20);
     }
@@ -290,30 +451,43 @@ int main()
             }
         }
 
+        bool do_render = false;
         // implement scroll
         if (g.do_scroll)
         {
-            set(led);
             g.wait_accumulator += g.wait_step;
             if (g.wait_accumulator >= g.wait_threshold)
             {
                 g.wait_accumulator -= g.wait_threshold;
                 --g.text_offset;
+                do_render = true;
 
-                // render text to display.
-                display.clear();
-                auto columns_rendered = render_string( g.text_buffer, g.text_offset);
-                if (columns_rendered < 8 * matrix_count)
-                {
-                    render_string( g.text_buffer, 0);
-                    if (columns_rendered == 0)
-                    {
-                        g.text_offset = 0;
-                    }
-                }
-                display.transmit();
             }
-            clear(led);
+        }
+
+        if (do_render or g.snowflakes_falling)
+        {
+            // render text to display.
+            display.clear();
+            auto columns_rendered = render_string( g.text_buffer, g.text_offset);
+            if (g.do_scroll and columns_rendered < 8 * matrix_count)
+            {
+                render_string( g.text_buffer, 0);
+                if (columns_rendered == 0)
+                {
+                    g.text_offset = 0;
+                }
+            }
+        }
+
+        if (g.snowflakes_falling)
+        {
+            snowflakes.render( display, g.do_snowflakes);
+        }
+
+        if (do_render or g.snowflakes_falling)
+        {
+            display.transmit();
         }
     }
 }
