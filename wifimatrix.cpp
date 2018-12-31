@@ -21,6 +21,19 @@
 
 namespace {
 
+template< typename T>
+struct identity
+{
+    using type = T;
+};
+
+template<typename T>
+T min( const T &a, const typename identity<T>::type &b)
+{
+    if (a<b) return a;
+    return b;
+}
+
 // setup to talk to a max7219 display array.
 struct spi_pins
 {
@@ -42,6 +55,28 @@ uint16_t my_rand()
 {
     static uint16_t state;
     return state += 13331; // adding a prime number
+}
+
+int16_t plusminus( int16_t range)
+{
+    return my_rand() % (2 * range + 1) - range;
+}
+
+
+
+uint16_t no_more_than( uint16_t range)
+{
+    return my_rand() % range;
+}
+
+int16_t plusminus( int16_t offset, int16_t range)
+{
+    int16_t val = no_more_than( range) + offset;
+    if (my_rand() & 0x80)
+    {
+        val = -val;
+    }
+    return val;
 }
 
 
@@ -67,8 +102,12 @@ struct global_state_type
     uint8_t  wait_step = 48;
     uint8_t  wait_accumulator = 0;
     static constexpr uint8_t wait_threshold = 128;
+
     bool do_snowflakes = false;
-    bool snowflakes_falling = false;
+    bool snowflakes_active = false;
+
+    bool do_fireworks = false;
+    bool fireworks_active = false;
 } g;
 
 // communication with esp-link
@@ -265,7 +304,15 @@ void update( const esp_link::packet *p, uint16_t size)
             g.do_snowflakes = parse_uint16( message.buffer, message.buffer + message.len) != 0;
             if (g.do_snowflakes)
             {
-                g.snowflakes_falling = true;
+                g.snowflakes_active = true;
+            }
+        }
+        else if (consume( topic_ptr, topic_end, "fireworks"))
+        {
+            g.do_fireworks = parse_uint16( message.buffer, message.buffer + message.len) != 0;
+            if (g.do_fireworks)
+            {
+                g.fireworks_active = true;
             }
         }
     }
@@ -301,6 +348,7 @@ public:
                 if (create_new)
                 {
                     flake = random_snowflake();
+                    active = true;
                 }
             }
             else
@@ -404,6 +452,215 @@ private:
     int8_t wind2 = -3;
 } snowflakes;
 
+class dot
+{
+public:
+
+    dot()
+    :x{0}, y{y_end}
+    {
+    }
+
+    dot( int16_t x, uint8_t y)
+    :x{x},y{y}
+    {
+    }
+
+    void render( display_type &display) const
+    {
+        if (
+            not at_end() and
+            x >= 0 and x < 8*x_scale*matrix_count and
+            y >= 0)
+        {
+            display.set_pixel( x / x_scale, y / y_scale);
+        }
+    }
+
+    bool at_end() const
+    {
+        return y >= y_end;
+    }
+
+
+    static constexpr uint8_t x_scale = 16;
+    static constexpr uint8_t y_scale = 16;
+    static constexpr uint8_t y_end = 8 * y_scale;
+
+    int16_t x; // in 12.4 fixed point
+    int16_t y;  // in12.4 fixed point
+};
+
+class velocity_dot : public dot
+{
+public:
+    velocity_dot()
+    :dot{},
+     vx{0},
+     vy{0}
+    {
+
+    }
+
+    velocity_dot( int16_t x, uint8_t y, int16_t vx, int8_t vy)
+    :dot{x,y}, vx{vx}, vy{vy}
+    {
+    }
+
+    void step(int8_t gravity)
+    {
+        if (not at_end())
+        {
+            x += vx;
+            y += vy;
+            vy += gravity;
+        }
+    }
+
+
+    int16_t vx;
+    int8_t vy;
+};
+
+class rocket
+{
+public:
+    rocket()
+    :fuse{0}, trigger{127}
+    {
+    }
+
+    rocket(int16_t x, int16_t vx, int8_t vy, uint8_t fuse, int8_t trigger = 0)
+    :
+     fuse{fuse},
+     trigger{trigger}
+    {
+        dots[0] = {x, 127, vx, vy};
+    }
+
+    bool step(int8_t gravity)
+    {
+        // rocket on the ground, fuse burning
+        if (fuse)
+        {
+            --fuse;
+            return true;
+        }
+
+        // in flight, before burst
+        if (not dots[0].at_end() and dots[0].vy < trigger)
+        {
+            // create a trail of at most 4 dots
+            for (uint8_t dot = min(dot_count, 4) - 1; dot > 0; --dot)
+            {
+                dots[dot] = dots[dot-1];
+            }
+
+            dots[0].step( gravity);
+
+            // do we burst now?
+            if (dots[0].vy >= trigger)
+            {
+                constexpr static int8_t v_offset = 5;
+                // make sure we are always in the burst state from here on
+                trigger = -128;
+                for (auto &dot : dots)
+                {
+                    dot.x = dots[0].x;
+                    dot.y = dots[0].y;
+                    dot.vx = dots[0].vx + plusminus( v_offset, v_offset);
+                    dot.vy = dots[0].vy + plusminus( 1, v_offset);
+                }
+            }
+            return true;
+        }
+
+        // after burst
+        bool active_dot = false;
+        for ( auto &dot : dots)
+        {
+            if (!dot.at_end())
+            {
+                active_dot = true;
+                dot.step( gravity);
+            }
+        }
+
+        return active_dot;
+    }
+
+    void render( display_type &display) const
+    {
+        if (not fuse)
+        {
+            for (const auto &dot: dots)
+            {
+                dot.render( display);
+            }
+        }
+    }
+
+private:
+    static constexpr uint8_t dot_count = 8;
+    velocity_dot dots[dot_count];
+    uint8_t fuse;
+    int8_t trigger;
+};
+
+class rockets_type
+{
+public:
+    rockets_type()
+    {
+        for (auto & rocket: rockets)
+        {
+            rocket = random_rocket();
+        }
+    }
+
+    bool render( display_type &display, bool make_new)
+    {
+        constexpr int8_t gravity = 1;
+        bool active = false;
+        for (auto &rocket: rockets)
+        {
+            if (rocket.step( gravity))
+            {
+                active = true;
+                rocket.render( display);
+            }
+            else if (make_new)
+            {
+                rocket = random_rocket();
+                active = true;
+            }
+        }
+
+        return active;
+    }
+
+private:
+    static rocket random_rocket()
+    {
+        constexpr static int16_t vx_range = 10;
+        constexpr static int8_t vy_range = 10;
+        constexpr static uint8_t fuse_range = 150;
+        //constexpr static uint8_t trigger_range = 6;
+        return
+            {
+                static_cast<int16_t>( no_more_than( 8*matrix_count*16)), // x
+                static_cast<int16_t>( plusminus( vx_range)), // vx
+                static_cast<int8_t>(-(no_more_than( vy_range) + 8)), // vy, negative is up
+                static_cast<uint8_t>(no_more_than( fuse_range)), // fuse
+                //static_cast<int8_t>( no_more_than( trigger_range) - 2)
+                0
+            };
+
+    }
+    constexpr static uint8_t rocket_count = 5;
+    rocket rockets[rocket_count];
+} rockets;
+
 }
 
 int main()
@@ -465,7 +722,7 @@ int main()
             }
         }
 
-        if (do_render or g.snowflakes_falling)
+        if (do_render or g.snowflakes_active or g.fireworks_active)
         {
             // render text to display.
             display.clear();
@@ -480,12 +737,17 @@ int main()
             }
         }
 
-        if (g.snowflakes_falling)
+        if (g.snowflakes_active)
         {
-            snowflakes.render( display, g.do_snowflakes);
+            g.snowflakes_active = snowflakes.render( display, g.do_snowflakes);
         }
 
-        if (do_render or g.snowflakes_falling)
+        if (g.fireworks_active)
+        {
+            g.fireworks_active = rockets.render( display, g.do_fireworks);
+        }
+
+        if (do_render or g.snowflakes_active or g.fireworks_active)
         {
             display.transmit();
         }
