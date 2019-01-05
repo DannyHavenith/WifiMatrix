@@ -561,7 +561,7 @@ public:
             // do we burst now?
             if (dots[0].vy >= trigger)
             {
-                constexpr static int8_t v_offset = 5;
+                constexpr static int8_t v_offset = 6;
                 // make sure we are always in the burst state from here on
                 trigger = -128;
                 for (auto &dot : dots)
@@ -642,9 +642,9 @@ public:
 private:
     static rocket random_rocket()
     {
-        constexpr static int16_t vx_range = 10;
+        constexpr static int16_t vx_range = 8;
         constexpr static int8_t vy_range = 10;
-        constexpr static uint8_t fuse_range = 150;
+        constexpr static uint8_t fuse_range = 110;
         //constexpr static uint8_t trigger_range = 6;
         return
             {
