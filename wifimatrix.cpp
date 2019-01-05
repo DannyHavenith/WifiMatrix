@@ -16,6 +16,8 @@
 #include <string.h>
 #include <util/delay.h>
 #include "timer.h"
+#include "snowflakes.hpp"
+#include "simple_random.hpp"
 
 #define MQTT_BASE_NAME "matrix/"
 
@@ -48,36 +50,6 @@ using spi_type = bitbanged_spi< spi_pins>;
 constexpr uint8_t matrix_count = 9;
 using display_type = max7219::display_buffer<matrix_count, spi_type, csk_type>;
 display_type display;
-
-
-/// very crude pseudo random generator
-uint16_t my_rand()
-{
-    static uint16_t state;
-    return state += 13331; // adding a prime number
-}
-
-int16_t plusminus( int16_t range)
-{
-    return my_rand() % (2 * range + 1) - range;
-}
-
-
-
-uint16_t no_more_than( uint16_t range)
-{
-    return my_rand() % range;
-}
-
-int16_t plusminus( int16_t offset, int16_t range)
-{
-    int16_t val = no_more_than( range) + offset;
-    if (my_rand() & 0x80)
-    {
-        val = -val;
-    }
-    return val;
-}
 
 
 /**
@@ -178,6 +150,17 @@ private:
     const uint8_t *next_column;    ///< pointer in pgm space to next character pixel column
 };
 
+/**
+ * Render a string to the display at its current cursor position.
+ *
+ * Parameter 'offset' moves the string to the right by inserting
+ * empty columns or, if offset is negative, to the left by not rendering
+ * the first columns of the text.
+ *
+ * This function returns the number of columns it tried to render, which
+ * could be more than the actual amount of columns on the display.
+ *
+ */
 uint16_t render_string( const char *str, int16_t offset = 0)
 {
     uint16_t columns = 0;
@@ -266,7 +249,7 @@ void update( const esp_link::packet *p, uint16_t size)
         {
             display.clear();
             my_strcpy( g.text_buffer, message.buffer, message.len);
-            g.do_scroll = render_string( g.text_buffer) > 8 * matrix_count;
+            g.do_scroll = render_string( g.text_buffer) > display_type::column_count;
             g.wait_accumulator = 0;
             if (not g.do_scroll)
             {
@@ -329,129 +312,17 @@ void connected( const esp_link::packet *p, uint16_t size)
     clear(led);
 }
 
-class snowflakes_type
-{
-public:
+// fireworks related classes
 
-    bool render( display_type &display, bool create_new = true)
-    {
-        update_wind();
-
-        bool active = false;
-        for ( uint8_t i = 0; i < count; ++i)
-        {
-            auto &flake = flakes[i];
-
-            flake.step();
-            if (flake.at_end())
-            {
-                if (create_new)
-                {
-                    flake = random_snowflake();
-                    active = true;
-                }
-            }
-            else
-            {
-                active = true;
-            }
-            if (i < threshold)
-            {
-                flake.offset_x( wind1);
-            }
-            else
-            {
-                flake.offset_x( wind2);
-            }
-            flake.render( display);
-        }
-        return active;
-    }
-
-private:
-
-    class snowflake
-    {
-    public:
-        snowflake()
-        :x{0}, y{y_end}, vy{0}
-        {
-
-        }
-        snowflake( int16_t x, uint8_t vy)
-        :x{x}, y{0}, vy{vy}
-        {
-        }
-
-        void step( )
-        {
-            if (not at_end())
-            {
-                y += vy;
-            }
-        }
-
-        void offset_x( int8_t offset)
-        {
-            x += offset;
-            if (x < 0 or x >= (8 * matrix_count * x_scale))
-            {
-                x = 0;
-                y = y_end;
-            }
-        }
-
-        void render( display_type &display)
-        {
-            if (not at_end())
-            {
-                display.set_pixel( x / x_scale, y / y_scale);
-            }
-        }
-
-        bool at_end() const
-        {
-            return y >= y_end;
-        }
-
-    private:
-        static constexpr uint8_t x_scale = 16;
-        static constexpr uint8_t y_scale = 16;
-        static constexpr uint8_t y_end = 8 * y_scale;
-
-        int16_t x; // in 10.6 fixed point
-        uint8_t y;  // in 4.4 fixed point
-        uint8_t vy; // in 4.4 fixed point
-    };
-
-    static snowflake random_snowflake()
-    {
-        return
-            {
-                static_cast<int16_t>( my_rand()%(8*matrix_count*16)),
-                static_cast<uint8_t>( 1 + my_rand()%4)
-            };
-    }
-
-    void update_wind()
-    {
-        constexpr int8_t wind_limit = 3;
-        if (wind1 > -wind_limit and (my_rand() & 0x18) == 0) --wind1;
-        if (wind1 < wind_limit  and (my_rand() & 0x18) == 0) ++wind1;
-        if (wind2 > -wind_limit and (my_rand() & 0x18) == 0) --wind2;
-        if (wind2 < wind_limit  and (my_rand() & 0x18) == 0) ++wind2;
-
-        if (threshold > count/3 and (my_rand() & 0x10)) --threshold;
-        if (threshold < (2 * count) / 3  and (my_rand() & 0x10)) ++threshold;
-    }
-
-    static constexpr uint8_t count = 20;
-    int8_t threshold = count/2;
-    snowflake flakes[20];
-    int8_t wind1 = 0;
-    int8_t wind2 = -3;
-} snowflakes;
-
+/**
+ * This class represents a dot rendered on a matrix display.
+ *
+ * Each dot has an x,y-position where x and y have a higher resolution
+ * than the actual dots on the matrix.
+ *
+ * A dot can be "at_end", which means that the dot will not be
+ * displayed.
+ */
 class dot
 {
 public:
@@ -491,6 +362,9 @@ public:
     int16_t y;  // in12.4 fixed point
 };
 
+/**
+ * a moving dot
+ */
 class velocity_dot : public dot
 {
 public:
@@ -666,8 +540,12 @@ private:
 int main()
 {
     using esp_link::mqtt::setup;
+
+    snowflakes_type<display_type> snowflakes;
+
     make_output(led);
     display.auto_shift( false);
+
 
     display.clear();
     for (int16_t offset = 0; offset > -150; --offset)
@@ -708,7 +586,9 @@ int main()
             }
         }
 
-        bool do_render = false;
+        // if one of the animations is active, render text.
+        bool do_render = g.snowflakes_active or g.fireworks_active;
+
         // implement scroll
         if (g.do_scroll)
         {
@@ -718,21 +598,31 @@ int main()
                 g.wait_accumulator -= g.wait_threshold;
                 --g.text_offset;
                 do_render = true;
-
             }
         }
 
-        if (do_render or g.snowflakes_active or g.fireworks_active)
+        if (do_render)
         {
             // render text to display.
             display.clear();
             auto columns_rendered = render_string( g.text_buffer, g.text_offset);
-            if (g.do_scroll and columns_rendered < 8 * matrix_count)
+
+            // as the string is scrolling off to the left, we need to draw the start
+            // of the string on the right again.
+
+            // add some space between the end of the string and the start of the
+            // repeated string.
+            static constexpr auto repeat_space = 6;
+            if (g.do_scroll and columns_rendered < display_type::column_count + repeat_space)
             {
+                for (uint8_t count = repeat_space; count; --count)
+                {
+                    display.push_column( 0);
+                }
                 render_string( g.text_buffer, 0);
                 if (columns_rendered == 0)
                 {
-                    g.text_offset = 0;
+                    g.text_offset = repeat_space;
                 }
             }
         }
@@ -747,7 +637,7 @@ int main()
             g.fireworks_active = rockets.render( display, g.do_fireworks);
         }
 
-        if (do_render or g.snowflakes_active or g.fireworks_active)
+        if (do_render)
         {
             display.transmit();
         }
