@@ -110,6 +110,11 @@ public:
         {
             return 0;
         }
+
+        // special case: if next_column isn't an actual pointer but a "low integer",
+        // it is interpreted as the number of zeros to emit before delivering the next
+        // character. This special case is there to implement whitespace characters that
+        // consist of more than one column of zeroes.
         if (next_column < reinterpret_cast<const uint8_t *>(4))
         {
             --next_column;
@@ -141,6 +146,8 @@ private:
         }
         else
         {
+            // find a null terminated range of column bytes in pgm memory
+            // that describe the characters shape.
             next_column = font5x8::find_character( character);
         }
         return true;
