@@ -12,6 +12,13 @@
 #include <avr_utilities/devices/bitbanged_spi.h>
 #include <avr_utilities/font5x8.hpp>
 #include <avr_utilities/simple_text_parsing.h>
+
+#include "flare.hpp"
+#define WS2811_PORT PORTB
+#include <ws2811/ws2811.h>
+#include <ws2811/rgb.h>
+#include <effects/water_torture.hpp>
+
 #include <avr/pgmspace.h>
 #include <string.h>
 #include <util/delay.h>
@@ -44,6 +51,10 @@ struct spi_pins
     pin_definitions::null_pin_type miso;
 };
 
+static constexpr uint8_t ws2811_pin = 1;
+static constexpr uint8_t led_count = 60;
+static constexpr uint8_t flare_count = 20;
+
 // this display has 9 matrices, talks through bit-banged spi and uses B4 as cs pin.
 using csk_type = PIN_TYPE( B, 4);
 using spi_type = bitbanged_spi< spi_pins>;
@@ -57,6 +68,10 @@ display_type display;
  */
 struct global_state_type
 {
+    PIN_TYPE( B, 1) ws2811_signal;
+    ws2811::rgb leds[led_count] = {{ 128, 0,0}, {0, 128, 0}, {0, 128, 0}};
+    flare flares[flare_count];
+    bool leds_changed = false;
     uint8_t flashSpeed   = 25;
     uint8_t flashCounter = 0;
     bool    displayIsOn = true;
@@ -77,13 +92,14 @@ struct global_state_type
 
     bool do_snowflakes = false;
     bool snowflakes_active = false;
+    bool do_droplets = false;
 
     bool do_fireworks = false;
     bool fireworks_active = false;
 } g;
 
 // communication with esp-link
-esp_link::client::uart_type uart{19200};
+esp_link::client::uart_type uart{4800};
 IMPLEMENT_UART_INTERRUPT( uart);
 esp_link::client esp{ uart};
 
@@ -115,7 +131,7 @@ public:
         // it is interpreted as the number of zeros to emit before delivering the next
         // character. This special case is there to implement whitespace characters that
         // consist of more than one column of zeroes.
-        if (next_column < reinterpret_cast<const uint8_t *>(4))
+        if (next_column < reinterpret_cast<const uint8_t *>(10))
         {
             --next_column;
             return 0;
@@ -210,25 +226,123 @@ char *my_strcpy( char *dest, const char *src, uint16_t len)
     return dest;
 }
 
-template< typename IntegerType>
-bool assign_if_topic(
-        IntegerType &value,
-        const char *expected,
-        const char *(&topic_start),
-        const char *topic_end,
-        esp_link::string_ref &message)
+template <size_t buffer_size>
+char *my_strcpy( char (&dest)[buffer_size], const char *src, uint16_t len)
 {
-    using namespace text_parsing;
-    if (consume(topic_start, topic_end, expected))
+    if (len >= buffer_size )
     {
-        value = parse_uint16( message.buffer, message.buffer + message.len);
-        return true;
+        len = buffer_size - 1;
+    }
+    return my_strcpy( static_cast<char*>(dest), src, len);
+}
+
+uint16_t parse_uint16( esp_link::string_ref &string)
+{
+    return text_parsing::parse_uint16( string.buffer, string.buffer + string.len);
+}
+
+bool consume( esp_link::string_ref &string, const char *expectation)
+{
+    return text_parsing::consume( string.buffer, string.buffer + string.len, expectation);
+}
+
+
+uint8_t to_decimal( char hex_digit)
+{
+    if (hex_digit < '0') return 0;
+    if (hex_digit <= '9') return hex_digit - '0';
+    hex_digit |= 0x20;
+    if (hex_digit < 'a') return 0;
+    if (hex_digit <= 'f') return hex_digit - 'a' + 10;
+    return 0;
+}
+
+ws2811::rgb parse_rgb_hex(  const char *(&input), const char *end)
+{
+    ws2811::rgb result{0,0,0};
+
+    if (input != end) result.red   = to_decimal( *input++);
+    if (input != end) result.red   = result.red * 16 + to_decimal( *input++);
+
+    if (input != end) result.green = to_decimal( *input++);
+    if (input != end) result.green = result.green * 16 + to_decimal( *input++);
+
+    if (input != end) result.blue   = to_decimal( *input++);
+    if (input != end) result.blue   = result.blue * 16 + to_decimal( *input++);
+
+    return result;
+}
+
+ws2811::rgb parse_rgb( esp_link::string_ref &string)
+{
+    ws2811::rgb result{0,0,0};
+
+    if (consume( string, "#"))
+    {
+        result = parse_rgb_hex( string.buffer, string.buffer + string.len);
     }
     else
     {
-        return false;
+
+        result.red = parse_uint16( string);
+        consume( string, ",");
+        result.green = parse_uint16( string);
+        consume( string, ",");
+        result.blue = parse_uint16( string);
     }
+
+    return result;
 }
+
+/**
+ * return the index of an inactive flare, if any.
+ * otherwise will return count.
+ *
+ * WATCH OUT: the returned index cannot be used
+ * without testing for it being 'count' first.
+ */
+template<size_t count>
+uint8_t find_idle_flare( flare (&flares)[count], uint8_t led_index)
+{
+
+
+    // first try to find a flare that is already animating this led
+    for (uint8_t index = 0; index < count; ++index)
+    {
+        if (flares[index].led_index() == led_index)
+        {
+            return index;
+        }
+    }
+
+    // then try to find one that is idle
+    for (uint8_t index = 0; index < count; ++index)
+    {
+        if (not flares[index].is_active())
+        {
+            return index;
+        }
+    }
+
+    return count;
+}
+
+template<size_t led_count, size_t flare_count>
+void clear_leds( ws2811::rgb (&leds)[led_count], flare (&flares)[flare_count])
+{
+    for (auto &flare: flares)
+    {
+        flare.stop();
+    }
+
+    for (auto &currentLed : leds)
+    {
+        currentLed = {0,0,0};
+    }
+
+}
+
+
 
 /**
  * This function is called when an update is received on the subscribed MQTT topic.
@@ -246,13 +360,11 @@ void update( const esp_link::packet *p, uint16_t size)
     parser.get( topic);
     parser.get( message);
 
-    const char *topic_ptr = topic.buffer;
-    const char *topic_end = topic_ptr + topic.len;
 
     // if the topic is indeed the expected one...
-    if (consume(topic_ptr, topic_end, MQTT_BASE_NAME))
+    if (consume(topic, MQTT_BASE_NAME))
     {
-        if (consume(topic_ptr, topic_end, "text"))
+        if (consume( topic, "text"))
         {
             display.clear();
             my_strcpy( g.text_buffer, message.buffer, message.len);
@@ -264,15 +376,15 @@ void update( const esp_link::packet *p, uint16_t size)
                 g.text_offset = 0;
             }
         }
-        else if (consume( topic_ptr, topic_end, "flash"))
+        else if (consume( topic, "flash"))
         {
-            if (consume( topic_ptr, topic_end, "Speed"))
+            if (consume( topic, "Speed"))
             {
-                g.flashSpeed = parse_uint16( message.buffer, message.buffer + message.len);
+                g.flashSpeed = parse_uint16( message);
             }
             else
             {
-                uint8_t value = parse_uint16( message.buffer, message.buffer + message.len);
+                uint8_t value = parse_uint16( message);
                 if (value)
                 {
                     g.flashCounter = g.flashSpeed;
@@ -285,25 +397,123 @@ void update( const esp_link::packet *p, uint16_t size)
                 }
             }
         }
-        else if (consume( topic_ptr, topic_end, "scrollSpeed"))
+        else if (consume( topic, "scrollSpeed"))
         {
-            g.set_speed( parse_uint16( message.buffer, message.buffer + message.len));
+            g.set_speed( parse_uint16( message));
         }
-        else if (consume( topic_ptr, topic_end, "snow"))
+        else if (consume( topic, "snow"))
         {
-            g.do_snowflakes = parse_uint16( message.buffer, message.buffer + message.len) != 0;
+            g.do_snowflakes = parse_uint16( message) != 0;
             if (g.do_snowflakes)
             {
                 g.snowflakes_active = true;
             }
         }
-        else if (consume( topic_ptr, topic_end, "fireworks"))
+        else if (consume( topic, "fireworks"))
         {
-            g.do_fireworks = parse_uint16( message.buffer, message.buffer + message.len) != 0;
+            g.do_fireworks = parse_uint16( message) != 0;
             if (g.do_fireworks)
             {
                 g.fireworks_active = true;
             }
+        }
+        else if (consume( topic, "brightness"))
+        {
+            display.brightness( parse_uint16( message));
+        }
+        else if (consume( topic, "led/"))
+        {
+            uint8_t led_index = parse_uint16( topic);
+            if ( led_index < led_count)
+            {
+                g.leds[led_index] = parse_rgb(message);
+                g.leds_changed = true;
+            }
+        }
+        else if (consume( topic, "ledsOff"))
+        {
+            if (parse_uint16(message))
+            {
+                clear_leds( g.leds, g.flares);
+            }
+            g.leds_changed = true;
+        }
+        else if (consume( topic, "drops"))
+        {
+            if (parse_uint16(message))
+            {
+                g.do_droplets = true;
+            }
+            else
+            {
+                g.do_droplets = false;
+                g.leds_changed = true;
+                clear(g.leds);
+            }
+        }
+        else if (consume( topic, "flare/"))
+        {
+            uint8_t flare_index = 0;
+            bool do_find_idle_flare = false;
+            if (consume(topic, "*"))
+            {
+                // find an idle flare as soon as we know which
+                // led needs to be animated.
+                do_find_idle_flare = true;
+            }
+            else
+            {
+                flare_index = parse_uint16( topic);
+            }
+
+            if (flare_index < flare_count)
+            {
+                uint8_t led_index = 0;
+                ws2811::rgb from{0,0,0};
+                ws2811::rgb to{32,32,32};
+                uint8_t speed = 64;
+                uint8_t mode = 0;
+
+                led_index = parse_uint16( message);
+                if (led_index >= led_count)
+                {
+                    led_index = 0;
+                }
+                if (do_find_idle_flare)
+                {
+                    flare_index = find_idle_flare( g.flares, led_index);
+                }
+                if (consume(message, ","))
+                {
+                    mode = parse_uint16( message);
+                    if (consume( message, ","))
+                    {
+                        if (consume(message, "*"))
+                        {
+                            from = g.leds[led_index];
+                        }
+                        else
+                        {
+                            from = parse_rgb( message);
+                        }
+                        if (consume( message, ","))
+                        {
+                            to = parse_rgb( message);
+                            if (consume( message, ","))
+                            {
+                                speed = parse_uint16( message);
+                            }
+                        }
+                    }
+                }
+                if (speed != 255) ++speed;
+                if (mode >= flare::ModeCount)
+                {
+                    mode = flare::OneShot;
+                }
+                g.flares[flare_index].setup( led_index, static_cast<flare::Mode>( mode), from, to, speed);
+            }
+
         }
     }
 }
@@ -314,7 +524,7 @@ void connected( const esp_link::packet *p, uint16_t size)
     using esp_link::mqtt::subscribe;
     using esp_link::mqtt::publish;
     //esp.send("connected\n");
-    esp.execute( subscribe, MQTT_BASE_NAME "+", 0);
+    esp.execute( subscribe, MQTT_BASE_NAME "#", 0);
     esp.execute( publish, MQTT_BASE_NAME "version", "0.2", 0, false);
     clear(led);
 }
@@ -542,6 +752,50 @@ private:
     rocket rockets[rocket_count];
 } rockets;
 
+void setup_ws2811()
+{
+    // set all pins low (no pull-up)
+    // and make the ws2811 pin an output
+    clear( g.ws2811_signal);
+    make_output( g.ws2811_signal);
+}
+
+typedef water_torture::droplet<ws2811::rgb[led_count], true> droplet_type;
+constexpr uint8_t droplet_count = 3;
+droplet_type droplets[droplet_count]; // droplets that can animate simultaneously.
+uint8_t current_droplet = 0; // index of the next droplet to be created
+uint16_t droplet_pause = 1; // how long to wait for the next one
+
+/// Create the complete water torture animation.
+/// This will render droplets at random intervals, up to a given maximum number of droplets.
+/// The maximum led count is 256
+template< typename buffer_type>
+void inline droplet_animate( buffer_type &leds)
+{
+
+        if (droplet_pause)
+        {
+            --droplet_pause;
+        }
+        else
+        {
+            if (!droplets[current_droplet].is_active())
+            {
+                water_torture::create_random_droplet( droplets[current_droplet]);
+                ++current_droplet;
+                if (current_droplet >= droplet_count) current_droplet = 0;
+                droplet_pause = 1;//200 + my_rand() % 128;
+            }
+        }
+
+        clear( leds);
+        for (uint8_t idx = 0; idx < droplet_count; ++idx)
+        {
+            droplets[idx].step( leds);
+        }
+}
+
+
 }
 
 int main()
@@ -553,14 +807,16 @@ int main()
     make_output(led);
     display.auto_shift( false);
 
-
+    setup_ws2811();
+    // we need to wait ~6s for the esp to get its act
+    // together.
     display.clear();
     for (int16_t offset = 0; offset > -150; --offset)
     {
         display.clear();
         render_string("wait wait wait wait wait wait wait", offset);
         display.transmit();
-        _delay_ms( 20);
+        _delay_ms( 60);
     }
 
     display.clear();
@@ -570,6 +826,10 @@ int main()
     while (not esp.sync()) toggle( led);
     display.clear();
     display.transmit();
+
+
+    clear( g.leds);
+    g.leds_changed = true;
 
     esp.execute( setup, &connected, nullptr, nullptr, &update);
     auto next = Timer::After( Timer::ticksPerSecond/50);
@@ -581,6 +841,31 @@ int main()
             esp.try_receive();
         }
         next = Timer::After( Timer::ticksPerSecond/50);
+
+        if (g.do_droplets)
+        {
+            droplet_animate(g.leds);
+            g.leds_changed = true;
+        }
+        else
+        {
+            for (auto &flare : g.flares)
+            {
+                flare.step();
+                if (flare.render( g.leds))
+                {
+                    g.leds_changed = true;
+                }
+            }
+        }
+
+        if (g.leds_changed)
+        {
+            cli();
+            send( g.leds, ws2811_pin);
+            sei();
+            g.leds_changed = false;
+        }
 
         // implement flash
         if (g.flashCounter)
